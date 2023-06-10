@@ -1,0 +1,243 @@
+"""Module to calculate the receptive field for a neural network."""
+from typing import Iterable, Optional, Tuple
+
+from torch import nn
+
+CONV_LAYERS = (nn.Conv1d, nn.Conv2d, nn.Conv3d)
+POOLING_LAYERS = (nn.MaxPool1d, nn.MaxPool2d, nn.MaxPool3d)
+TRANSFORM_LAYERS = CONV_LAYERS + POOLING_LAYERS
+
+
+def get_receptive_field(
+    module: nn.Module,
+    exclude_layers: Optional[Iterable[str]] = ("downsample",),
+    input_data_size: Optional[int] = None,
+    verbose: bool = True,
+) -> int:
+    """Calculate the receptive field for each layer throughout a convolutional neural network.
+
+    WARNING: Currently only considers convolutional and pooling layers.
+
+    Also NB: Doesn't track model operations through a forward() pass, just considers layers in
+    the order in which they're defined in __init__(). As such, operations such as atrous
+    convolution are not handled correctly.
+
+    For 2D or 3D input data, assumes all kernels are squares/cubes.
+
+    Args:
+        module: A PyTorch module to calculate the receptive field for.
+        input_data_size: Number of feature in hypothetical input data.
+        exlude_layers: Ignore all layers with any of these strings in their names. Useful to skip
+            things like projection shortcuts in skip connections or classifier heads.
+    """
+    rf_calculator = ReceptiveFieldCalculator()
+    return rf_calculator.get_receptive_field(
+        module=module,
+        input_data_size=input_data_size,
+        exclude_layers=exclude_layers,
+        verbose=verbose,
+    )
+
+
+class Layer:
+
+    """Class to wrap a nn.Module and describe it in a standard way."""
+
+    def __init__(self, layer: nn.Module):
+        assert isinstance(
+            layer, TRANSFORM_LAYERS
+        ), f"Unsupported layer: {layer}; must be one of {TRANSFORM_LAYERS}."
+
+        self.layer_type = type(layer).__name__
+        self.kernel_size = self.extract_value(layer.kernel_size)
+        self.stride = self.extract_value(layer.stride)
+        self.padding = self.extract_value(layer.padding)
+        self.dilation = self.extract_value(layer.dilation)
+        if self.padding == "same":
+            # Not true for even-length kernels, but no value for padding can replicate in that case
+            self.padding = int((self.kernel_size - 1) / 2 * self.dilation)
+        elif self.padding == "valid":
+            self.padding = 0
+
+    @staticmethod
+    def extract_value(value) -> int:
+        """Parse a field for a 1-, 2- or 3D nn layer and extract the value.
+
+        Useful for handling parameters that may be scalars or multi-dimensional tuples etc.
+        """
+        if isinstance(value, (list, tuple)):
+            return value[0]
+        return value
+
+    def __name__(self):
+        layer_name = f"{self.layer_type}(k{self.kernel_size}"
+        if self.stride > 1:
+            layer_name += f"s{self.stride}"
+        if self.padding != (self.kernel_size - 1) / 2:
+            layer_name += f"p{self.padding}"
+        if self.dilation > 1:
+            layer_name += f"d{self.dilation}"
+        layer_name += ")"
+
+        return layer_name
+
+    def __repr__(self):
+        return self.__name__()
+
+
+class ReceptiveFieldCalculator:
+    """Class to calculate the receptive field of a module throughout the network."""
+
+    def get_receptive_field(
+        self,
+        module: nn.Module,
+        exclude_layers: Optional[Iterable[str]] = ("downsample", "classifier"),
+        input_data_size: Optional[int] = None,
+        verbose: bool = True,
+    ) -> Tuple[int, int]:
+        """Calculate the receptive field for each layer throughout a convolutional neural network.
+
+        Returns a tuple of (receptive field, distance between output features)
+
+        WARNING: Currently only considers convolutional and pooling layers.
+
+        Also NB: Doesn't track model operations through a forward() pass, just considers layers in
+        the order in which they're defined in __init__(). As such, operations such as atrous
+        convolution are not handled correctly.
+
+        For 2D or 3D input data, assumes all kernels are squares/cubes.
+
+        Args:
+            module: A PyTorch module to calculate the receptive field for.
+            exlude_layers: Ignore all layers with any of these strings in their names. Useful to
+                skip things like projection shortcuts in skip connections or classifier heads.
+            input_data_size: Number of features in hypothetical input data. If provided, will track
+                the number of output features the model will return.
+        """
+        receptive_field = 1
+        distance_between_features = 1
+        first_feature_centre = 0
+        num_features = input_data_size
+
+        if num_features is not None:
+            print("Input data size", input_data_size)
+
+        for name, layer in module.named_modules():
+            if not isinstance(layer, TRANSFORM_LAYERS):
+                continue
+
+            layer = Layer(layer)
+
+            if any(excluded in name for excluded in exclude_layers):
+                if verbose:
+                    print(f"Skipping {name} {layer}")
+                continue
+
+            kernel_size = layer.kernel_size
+            stride = layer.stride
+            padding = layer.padding
+            dilation = layer.dilation
+
+            receptive_field = self.get_output_receptive_field_size(
+                input_receptive_field_size=receptive_field,
+                kernel_size=kernel_size,
+                distance_between_features=distance_between_features,
+                dilation=dilation,
+            )
+
+            first_feature_centre = self.get_first_feature_output_centre(
+                first_feature_input_centre=first_feature_centre,
+                kernel_size=kernel_size,
+                padding=padding,
+                distance_between_features=distance_between_features,
+                dilation=dilation,
+            )
+
+            # Update the distance between features based on if the layer used striding
+            distance_between_features = distance_between_features * layer.stride
+
+            if num_features is not None:
+                num_features = self.get_num_output_features(
+                    num_input_features=num_features,
+                    kernel_size=kernel_size,
+                    padding=padding,
+                    stride=stride,
+                    dilation=dilation,
+                )
+
+            if verbose:
+                self.print_layer(
+                    name,
+                    layer,
+                    receptive_field,
+                    distance_between_features,
+                    first_feature_centre,
+                    num_features,
+                )
+
+        return receptive_field, distance_between_features
+
+    @staticmethod
+    def get_num_output_features(
+        num_input_features: int,
+        kernel_size: int,
+        padding: int,
+        stride: int,
+        dilation: int,
+    ) -> int:
+        """Calculate the number of output features after applying a layer."""
+        return int((num_input_features + 2 * padding / dilation - kernel_size) / stride) + 1
+
+    @staticmethod
+    def get_output_receptive_field_size(
+        input_receptive_field_size: int,
+        kernel_size: int,
+        dilation: int,
+        distance_between_features: int,
+    ) -> int:
+        """Calculate the receptive field after applying a layer.
+
+        Receptive field is a function of the receptive field and distance between features after the
+        previous layer, and the current layer's kernel's size and dilation.
+        """
+        return input_receptive_field_size + (kernel_size - 1) * distance_between_features * dilation
+
+    @staticmethod
+    def get_first_feature_output_centre(
+        first_feature_input_centre: float,
+        kernel_size: int,
+        padding: int,
+        dilation: int,
+        distance_between_features: int,
+    ) -> float:
+        """Calculate the centre of the first out feature after applying a layer, relative to the
+        input data.
+        """
+        return (
+            first_feature_input_centre
+            + ((kernel_size - 1) / 2 * dilation - padding) * distance_between_features
+        )
+
+    @staticmethod
+    def print_layer(
+        name: str,
+        layer: Layer,
+        receptive_field: int,
+        distance_between_features: int,
+        first_feature_centre: float,
+        num_features: Optional[int],
+    ):
+        """Print the details of a single layer in a network."""
+        if name:
+            layer_name = f"{name}: {layer}"
+        else:
+            name = layer.__name__
+
+        message = (
+            f"{layer_name}: {receptive_field=}, {distance_between_features=}, "
+            f"{first_feature_centre=}"
+        )
+        if num_features is not None:
+            message += f" ({num_features})"
+
+        print(message)
